@@ -31,7 +31,6 @@ import warnings
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import streamlit as st
 import yfinance as yf
 
@@ -157,12 +156,50 @@ def currency_symbol(ticker):
     return "₹" if market_of(ticker) == "IN" else "$"
 
 
-def find_col(df, prefix):
-    """Return the first column whose name starts with 'prefix', or None."""
-    for col in df.columns:
-        if col.startswith(prefix):
-            return col
-    return None
+# ─────────────────────────────────────────────────────────────
+#  INDICATOR MATH  (plain pandas/numpy - no pandas_ta dependency)
+#  pandas_ta is unmaintained and frequently fails to build on fresh
+#  installs (e.g. Streamlit Community Cloud), so every indicator below is
+#  implemented directly against pandas Series.
+# ─────────────────────────────────────────────────────────────
+def _ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def _atr(high, low, close, length=14):
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    # Wilder's smoothing (equivalent to an EMA with alpha = 1/length)
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def _rsi(close, length=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
+
+
+def _macd_hist(close, fast=12, slow=26, signal=9):
+    macd_line = _ema(close, fast) - _ema(close, slow)
+    signal_line = _ema(macd_line, signal)
+    return macd_line - signal_line
+
+
+def _bbands_width(close, length=20, std=2):
+    mid = close.rolling(length).mean()
+    dev = close.rolling(length).std()
+    upper = mid + std * dev
+    lower = mid - std * dev
+    return (upper - lower) / mid.replace(0, np.nan) * 100
 
 
 # ─────────────────────────────────────────────────────────────
@@ -190,41 +227,24 @@ def compute_indicators(df, config):
     df = df.copy()
     c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
 
-    df["atr"] = ta.atr(h, l, c, length=14)
+    df["atr"] = _atr(h, l, c, length=14)
     df["atr_pct"] = (df["atr"] / c) * 100
     df["atr_20min"] = df["atr_pct"].rolling(20).min()
 
-    bb = ta.bbands(c, length=20, std=2)
-    if bb is not None:
-        col_u, col_l, col_m = find_col(bb, "BBU"), find_col(bb, "BBL"), find_col(bb, "BBM")
-        if col_u and col_l and col_m:
-            df["bb_width"] = (bb[col_u] - bb[col_l]) / bb[col_m] * 100
-        else:
-            df["bb_width"] = np.nan
-    else:
-        df["bb_width"] = np.nan
-
+    df["bb_width"] = _bbands_width(c, length=20, std=2)
     df["bb_squeeze"] = df["bb_width"].rolling(252, min_periods=60).rank(pct=True) * 100
 
     df["vol_20avg"] = v.rolling(20).mean()
     df["vol_ratio"] = v / df["vol_20avg"]
 
-    df["rsi"] = ta.rsi(c, length=14)
+    df["rsi"] = _rsi(c, length=14)
 
-    macd = ta.macd(c, fast=12, slow=26, signal=9)
-    if macd is not None:
-        col_h = find_col(macd, "MACDh")
-        if col_h:
-            df["macd_hist"] = macd[col_h]
-            df["macd_hist_abs"] = df["macd_hist"].abs()
-        else:
-            df["macd_hist"] = df["macd_hist_abs"] = np.nan
-    else:
-        df["macd_hist"] = df["macd_hist_abs"] = np.nan
+    df["macd_hist"] = _macd_hist(c, fast=12, slow=26, signal=9)
+    df["macd_hist_abs"] = df["macd_hist"].abs()
 
-    df["ema9"] = ta.ema(c, length=config["ema_fast"])
-    df["ema21"] = ta.ema(c, length=config["ema_mid"])
-    df["ema50"] = ta.ema(c, length=config["ema_slow"])
+    df["ema9"] = _ema(c, config["ema_fast"])
+    df["ema21"] = _ema(c, config["ema_mid"])
+    df["ema50"] = _ema(c, config["ema_slow"])
 
     df["body_pct"] = ((df["Close"] - df["Open"]).abs() / df["Open"].replace(0, np.nan)) * 100
 
